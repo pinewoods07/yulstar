@@ -142,7 +142,7 @@ def evaluate(monthly,start,end,ratio=.8):
                 model.fit(train[FEATURES],train.commits)
             pred=model.predict(test[FEATURES])
             if not np.isfinite(pred).all():raise ValueError('유효하지 않은 예측값')
-            scores.append({'모델':name,'MAE':mean_absolute_error(test.commits,pred),'RMSE':np.sqrt(mean_squared_error(test.commits,pred)),'R²':r2_score(test.commits,pred) if test.commits.nunique()>1 else np.nan})
+            scores.append({'모델':name,'MAE':mean_absolute_error(test.commits,pred),'MSE':mean_squared_error(test.commits,pred),'R²':r2_score(test.commits,pred) if test.commits.nunique()>1 else np.nan})
             predictions[name]=pred
         except Exception as e:errors.append(f'{name}: 학습에 실패해 비교에서 제외했습니다. ({type(e).__name__})')
     if not scores:raise ValueError('모든 모델의 학습에 실패했습니다.')

@@ -109,14 +109,15 @@ scores,pred,info,errors=result[1]
 for e in errors:st.warning(e)
 st.header('03  점수 비교')
 st.write(f'학습: {info["first"]} ~ {str(pd.Period(info["cut"],freq="M")-1)} / {info["train"]:,}행 · 평가: {info["cut"]} ~ {info["last"]} / {info["test"]:,}행')
-st.info('MAE: 평균적으로 커밋 수를 몇 개 틀렸는지예요. RMSE: 크게 틀리면 더 큰 벌점을 줘요. 둘 다 낮을수록 좋아요. 정확도 %가 아니에요.')
-st.dataframe(scores.style.format({'MAE':'{:.2f}','RMSE':'{:.2f}','R²':'{:.3f}'},na_rep='계산 불가'),hide_index=True,use_container_width=True)
+st.info('MAE: 평균적으로 커밋 수를 몇 개 틀렸는지예요. MSE: 오차를 제곱한 뒤 평균을 내요. 크게 틀린 예측에 더 큰 벌점을 줘요. 둘 다 낮을수록 좋아요. 정확도 %가 아니에요.')
+st.dataframe(scores.style.format({'MAE':'{:.2f}','MSE':'{:.2f}','R²':'{:.3f}'},na_rep='계산 불가'),hide_index=True,use_container_width=True)
 best=scores.loc[scores.MAE.idxmin()];base=scores[scores['모델']=='베이스라인'].iloc[0]
 a,b=st.columns(2)
 with a:
-    st.subheader('모델별 평균 오차 비교')
-    st.caption('가로: 모델 / 세로: MAE (커밋 개수)')
-    st.bar_chart(scores.set_index('모델')[['MAE']],color='#087e72')
+    st.subheader('모델별 오차 비교')
+    metric=st.radio('그래프에서 비교할 점수',['MAE','MSE'],horizontal=True)
+    st.caption(f'가로: 모델 / 세로: {metric} (' + ('커밋 개수' if metric=='MAE' else '커밋 개수의 제곱') + ')')
+    st.bar_chart(scores.set_index('모델')[[metric]],color='#087e72')
     improvement=(1-best.MAE/base.MAE)*100 if base.MAE else 0
     st.write(f'**{best["모델"]}**의 MAE는 **{best.MAE:.2f}개**로 가장 낮았어요. 베이스라인보다 오차가 **{improvement:.2f}%** 작았어요.' if best['모델']!='베이스라인' else f'이번에는 베이스라인의 MAE **{base.MAE:.2f}개**가 가장 낮았어요.')
 with b:
@@ -125,8 +126,8 @@ with b:
     trend=pred.groupby('month')[['실제 커밋 수',best['모델']]].mean();st.line_chart(trend,color=['#243b40','#087e72'])
     last=trend.iloc[-1];st.write(f'**{trend.index[-1]}** 실제 평균은 **{last.iloc[0]:.2f}개**, {best["모델"]}의 예측 평균은 **{last.iloc[1]:.2f}개**였어요.')
 st.subheader('보고서에 붙일 문장')
-text=f'우리 팀은 깃허브 커밋 데이터를 이용해 월별 커밋 수를 예측하는 회귀 실험을 했습니다. 학습 데이터의 평균인 {info["mean"]:.2f}개를 항상 예측하는 베이스라인의 MAE는 {base.MAE:.2f}, RMSE는 {base.RMSE:.2f}였습니다. '
-text+=' '.join(f'{r["모델"]}의 MAE는 {r.MAE:.2f}, RMSE는 {r.RMSE:.2f}였습니다.' for _,r in scores.iterrows() if r['모델']!='베이스라인')
+text=f'우리 팀은 깃허브 커밋 데이터를 이용해 월별 커밋 수를 예측하는 회귀 실험을 했습니다. 학습 데이터의 평균인 {info["mean"]:.2f}개를 항상 예측하는 베이스라인의 MAE는 {base.MAE:.2f}, MSE는 {base.MSE:.2f}였습니다. '
+text+=' '.join(f'{r["모델"]}의 MAE는 {r.MAE:.2f}, MSE는 {r.MSE:.2f}였습니다.' for _,r in scores.iterrows() if r['모델']!='베이스라인')
 text+=f' 평가 기간은 {info["cut"]}부터 {info["last"]}까지이며, MAE가 가장 낮은 모델은 {best["모델"]}였습니다. 이 점수는 커밋 수 예측 성능을 보여 주며 AI가 개발량 증가의 원인이라는 증거나 코드 품질 향상의 증거는 아닙니다.'
 st.text_area('아래 문장을 복사해서 사용하세요',text,height=200)
 a,b,c=st.columns(3)
