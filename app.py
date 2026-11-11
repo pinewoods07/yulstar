@@ -3,7 +3,34 @@ import io
 import hashlib
 import streamlit as st
 import pandas as pd
+import numpy as np
 from analysis import local_files, github_files, request, aggregate, evaluate
+
+def rebuild_scores(scores, predictions):
+    """Normalize old/new result schemas from the same observed predictions."""
+    if not isinstance(scores, pd.DataFrame) or not isinstance(predictions, pd.DataFrame):
+        raise ValueError('이전 학습 결과를 읽을 수 없습니다. 다시 학습해 주세요.')
+    if '모델' not in scores or '실제 커밋 수' not in predictions:
+        raise ValueError('점수 계산에 필요한 결과가 없습니다. 다시 학습해 주세요.')
+    actual = pd.to_numeric(predictions['실제 커밋 수'], errors='coerce').to_numpy(dtype=float)
+    if not len(actual) or not np.isfinite(actual).all():
+        raise ValueError('실제 커밋 수가 올바르지 않습니다. 데이터를 확인하고 다시 학습해 주세요.')
+    rows = []
+    variance = np.sum((actual - actual.mean()) ** 2)
+    for name in scores['모델']:
+        if name not in predictions:
+            raise ValueError(f'{name}의 예측 결과가 없습니다. 다시 학습해 주세요.')
+        predicted = pd.to_numeric(predictions[name], errors='coerce').to_numpy(dtype=float)
+        if not np.isfinite(predicted).all():
+            raise ValueError(f'{name}의 예측값이 올바르지 않습니다. 다시 학습해 주세요.')
+        error = predicted - actual
+        rows.append({'모델': name, 'MAE': float(np.mean(np.abs(error))),
+                     'MSE': float(np.mean(error ** 2)),
+                     'R²': float(1 - np.sum(error ** 2) / variance) if variance else np.nan})
+    result = pd.DataFrame(rows, columns=['모델', 'MAE', 'MSE', 'R²'])
+    if result.empty or '베이스라인' not in result['모델'].values:
+        raise ValueError('베이스라인 결과가 없습니다. 다시 학습해 주세요.')
+    return result
 
 st.set_page_config(page_title='yulstar · AI 코딩 탐구실',page_icon='📊',layout='wide')
 st.markdown('''<style>.stApp{background:#f6f8fa}h1,h2,h3{color:#173d39}.stButton>button[kind="primary"]{background:#087e72;border:0}div[data-testid="stMetric"]{background:white;padding:18px;border:1px solid #dce6e5;border-radius:12px}div[data-testid="stMetricValue"]{color:#087e72}main .block-container{max-width:1200px;padding-top:2.5rem}</style>''',unsafe_allow_html=True)
@@ -94,7 +121,7 @@ ratio=c.selectbox('학습에 쓸 기간',[.8,.7,.9],format_func=lambda v:f'앞 {
 st.caption('마지막 달은 수집이 덜 끝났을 수 있어 기본적으로 제외해요. 그 달이 완전한 데이터라면 직접 포함할 수 있어요.')
 st.write('**입력:** 지난달 AI 표시 비율·개발자 수·커밋 수·시간 흐름 → **예측:** 이번 달 커밋 수')
 st.caption('같은 달의 저장소들은 모두 같은 학습/평가 구간에 들어가요. 바로 전월 기록이 없거나 AI 비율을 계산할 수 없는 행은 제외해요. 평가할 때도 매달 실제 지난달 기록을 사용해요.')
-settings=(selection_key,start,end,ratio)
+settings=('mse-mae-v2',selection_key,start,end,ratio)
 if st.button('모델 학습하고 점수 비교하기',type='primary'):
     if start>end:st.error('시작 월이 마지막 월보다 늦어요.')
     else:
@@ -106,6 +133,12 @@ result=st.session_state.get('result')
 if not result or result[0]!=settings:
     st.info('설정을 정한 뒤 학습 버튼을 누르면 실제 점수가 나와요. 설정 변경 후에는 다시 학습해야 해요.');st.stop()
 scores,pred,info,errors=result[1]
+try:
+    scores=rebuild_scores(scores,pred)
+except ValueError as exc:
+    st.session_state.pop('result',None)
+    st.error(str(exc))
+    st.stop()
 for e in errors:st.warning(e)
 st.header('03  점수 비교')
 st.write(f'학습: {info["first"]} ~ {str(pd.Period(info["cut"],freq="M")-1)} / {info["train"]:,}행 · 평가: {info["cut"]} ~ {info["last"]} / {info["test"]:,}행')
@@ -115,7 +148,7 @@ best=scores.loc[scores.MAE.idxmin()];base=scores[scores['모델']=='베이스라
 a,b=st.columns(2)
 with a:
     st.subheader('모델별 오차 비교')
-    metric=st.radio('그래프에서 비교할 점수',['MAE','MSE'],horizontal=True)
+    metric=st.radio('그래프에서 비교할 점수',['MAE','MSE'],horizontal=True,key='score_metric_mse_mae_v2')
     st.caption(f'가로: 모델 / 세로: {metric} (' + ('커밋 개수' if metric=='MAE' else '커밋 개수의 제곱') + ')')
     st.bar_chart(scores.set_index('모델')[[metric]],color='#087e72')
     improvement=(1-best.MAE/base.MAE)*100 if base.MAE else 0
