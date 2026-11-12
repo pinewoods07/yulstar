@@ -1,6 +1,7 @@
 from pathlib import Path
 import io
 import hashlib
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -121,13 +122,25 @@ ratio=c.selectbox('학습에 쓸 기간',[.8,.7,.9],format_func=lambda v:f'앞 {
 st.caption('마지막 달은 수집이 덜 끝났을 수 있어 기본적으로 제외해요. 그 달이 완전한 데이터라면 직접 포함할 수 있어요.')
 st.write('**입력:** 지난달 AI 표시 비율·개발자 수·커밋 수·시간 흐름 → **예측:** 이번 달 커밋 수')
 st.caption('같은 달의 저장소들은 모두 같은 학습/평가 구간에 들어가요. 바로 전월 기록이 없거나 AI 비율을 계산할 수 없는 행은 제외해요. 평가할 때도 매달 실제 지난달 기록을 사용해요.')
-settings=('mse-mae-v2',selection_key,start,end,ratio)
+objective=st.radio('설정을 고르는 기준',['MSE','MAE'],horizontal=True)
+st.caption('MSE는 큰 예측 실수를 더 크게 벌점 처리하고, MAE는 평균적으로 몇 개 틀렸는지를 봅니다. 선택한 기준 하나로 설정을 고르고 두 점수 모두 표시합니다.')
+with st.expander('어떤 값을 비교하나요?'):
+    st.write('선형 회귀: 절편 사용 여부 2가지. 포아송 회귀: alpha 0, 0.001, 0.01, 0.1, 1의 5가지.')
+    st.write('랜덤 포레스트: 나무 100·200개 × 깊이 6·12·제한 없음 × 잎 최소 2·5행 × 입력 비율 0.8·1.0의 24가지 조합과, 이전 설정(150개·깊이12·최소5행·비율0.8)을 합쳐 25가지를 비교합니다.')
+    st.write('총 32개 설정을 시간순 검증 3회씩 비교합니다. 학습용 구간 안에서 검증 평균 오차가 최소인 설정을 고른 뒤, 그 설정으로 학습용 전체를 다시 학습합니다. 마지막 평가용 구간은 설정 선택에 쓰지 않습니다.')
+    st.caption('random_state=42는 재현성을 위해, max_iter=3000은 계산을 충분히 반복하기 위해 고정합니다. 이 둘은 성능을 보고 고르지 않습니다. 계산은 데이터 크기에 따라 몇 분 걸릴 수 있습니다.')
+settings=('tuning-v3',selection_key,start,end,ratio,objective)
 if st.button('모델 학습하고 점수 비교하기',type='primary'):
     if start>end:st.error('시작 월이 마지막 월보다 늦어요.')
     else:
         try:
-            with st.spinner('같은 데이터로 네 가지 모델을 학습하고 있어요…'):
-                st.session_state.result=(settings,evaluate(monthly,start,end,ratio))
+            st.session_state.pop('result',None)
+            with st.spinner('여러 설정을 비교하고 선택한 값으로 다시 학습하고 있어요…'):
+                bar=st.progress(0,text='설정 비교 준비 중')
+                def update(done,total,label):
+                    bar.progress(done/total,text=f'{done}/{total}개 설정 · {label}')
+                st.session_state.result=(settings,evaluate(monthly,start,end,ratio,objective=objective,progress=update))
+                bar.empty()
         except Exception as e:st.error(str(e))
 result=st.session_state.get('result')
 if not result or result[0]!=settings:
@@ -140,28 +153,42 @@ except ValueError as exc:
     st.error(str(exc))
     st.stop()
 for e in errors:st.warning(e)
-st.header('03  점수 비교')
+st.header('03  자동으로 선택한 설정')
+chosen=pd.DataFrame(info['chosen'])
+trials=pd.DataFrame(info['trials'])
+st.write(f"학습 구간 안에서 시간순으로 3번 검증하여, 평균 {info['objective']}가 가장 작은 설정을 적용했습니다.")
+st.caption('아래 값은 비교한 후보 중의 최저값입니다. 모든 가능한 설정 중 최적이라고 단정하지 않으며, 최종 평가 오차가 반드시 감소하는 것도 아닙니다.')
+st.dataframe(chosen,hide_index=True,use_container_width=True)
+with st.expander('비교한 모든 설정과 검증 점수 보기'):
+    st.dataframe(trials,hide_index=True,use_container_width=True)
+    st.dataframe(pd.DataFrame(info['folds']),hide_index=True,use_container_width=True)
+st.download_button('설정 비교 근거 CSV 저장',trials.to_csv(index=False).encode('utf-8-sig'),'hyperparameter_search.csv','text/csv')
+st.download_button('선택 설정과 검증 기간 저장',json.dumps({k:v for k,v in info.items() if k!='trials'},ensure_ascii=False,indent=2,default=str).encode('utf-8'),'experiment_settings.json','application/json')
+st.header('04  최종 평가용 데이터의 점수')
 st.write(f'학습: {info["first"]} ~ {str(pd.Period(info["cut"],freq="M")-1)} / {info["train"]:,}행 · 평가: {info["cut"]} ~ {info["last"]} / {info["test"]:,}행')
 st.info('MAE: 평균적으로 커밋 수를 몇 개 틀렸는지예요. MSE: 오차를 제곱한 뒤 평균을 내요. 크게 틀린 예측에 더 큰 벌점을 줘요. 둘 다 낮을수록 좋아요. 정확도 %가 아니에요.')
 st.dataframe(scores.style.format({'MAE':'{:.2f}','MSE':'{:.2f}','R²':'{:.3f}'},na_rep='계산 불가'),hide_index=True,use_container_width=True)
-best=scores.loc[scores.MAE.idxmin()];base=scores[scores['모델']=='베이스라인'].iloc[0]
+best=scores.loc[scores[info['objective']].idxmin()];base=scores[scores['모델']=='베이스라인'].iloc[0]
 a,b=st.columns(2)
 with a:
     st.subheader('모델별 오차 비교')
     metric=st.radio('그래프에서 비교할 점수',['MAE','MSE'],horizontal=True,key='score_metric_mse_mae_v2')
     st.caption(f'가로: 모델 / 세로: {metric} (' + ('커밋 개수' if metric=='MAE' else '커밋 개수의 제곱') + ')')
     st.bar_chart(scores.set_index('모델')[[metric]],color='#087e72')
-    improvement=(1-best.MAE/base.MAE)*100 if base.MAE else 0
-    st.write(f'**{best["모델"]}**의 MAE는 **{best.MAE:.2f}개**로 가장 낮았어요. 베이스라인보다 오차가 **{improvement:.2f}%** 작았어요.' if best['모델']!='베이스라인' else f'이번에는 베이스라인의 MAE **{base.MAE:.2f}개**가 가장 낮았어요.')
+    key=info['objective']
+    improvement=(1-best[key]/base[key])*100 if base[key] else 0
+    st.write(f'최종 평가 {key} 최저 모델은 **{best["모델"]}**, 점수는 **{best[key]:.2f}**입니다. 베이스라인 대비 오차 감소율은 **{improvement:.2f}%**입니다.')
 with b:
     st.subheader('실제값과 예측값의 변화')
     st.caption('가로: 평가 월 / 세로: 저장소당 평균 커밋 수')
     trend=pred.groupby('month')[['실제 커밋 수',best['모델']]].mean();st.line_chart(trend,color=['#243b40','#087e72'])
     last=trend.iloc[-1];st.write(f'**{trend.index[-1]}** 실제 평균은 **{last.iloc[0]:.2f}개**, {best["모델"]}의 예측 평균은 **{last.iloc[1]:.2f}개**였어요.')
 st.subheader('보고서에 붙일 문장')
-text=f'우리 팀은 깃허브 커밋 데이터를 이용해 월별 커밋 수를 예측하는 회귀 실험을 했습니다. 학습 데이터의 평균인 {info["mean"]:.2f}개를 항상 예측하는 베이스라인의 MAE는 {base.MAE:.2f}, MSE는 {base.MSE:.2f}였습니다. '
+text=f'설정값을 임의로 확정하지 않고, 학습 구간에서 32개 후보 설정을 시간순으로 3번씩 검증하여 평균 {info["objective"]}가 가장 작은 설정을 모델별로 선택했습니다. 최종 평가 데이터는 설정 선택에 사용하지 않았습니다. '
+text+=' '.join(f"{r['모델']} 선택값은 {r['선택 설정']}이며 검증 평균 {info['objective']}는 {r['검증 평균 '+info['objective']]:.2f}였습니다." for r in info['chosen'])
+text+=f' 우리 팀은 깃허브 커밋 데이터를 이용해 월별 커밋 수를 예측하는 회귀 실험을 했습니다. 학습 데이터의 평균인 {info["mean"]:.2f}개를 항상 예측하는 베이스라인의 MAE는 {base.MAE:.2f}, MSE는 {base.MSE:.2f}였습니다. '
 text+=' '.join(f'{r["모델"]}의 MAE는 {r.MAE:.2f}, MSE는 {r.MSE:.2f}였습니다.' for _,r in scores.iterrows() if r['모델']!='베이스라인')
-text+=f' 평가 기간은 {info["cut"]}부터 {info["last"]}까지이며, MAE가 가장 낮은 모델은 {best["모델"]}였습니다. 이 점수는 커밋 수 예측 성능을 보여 주며 AI가 개발량 증가의 원인이라는 증거나 코드 품질 향상의 증거는 아닙니다.'
+text+=f' 평가 기간은 {info["cut"]}부터 {info["last"]}까지이며, {info["objective"]}가 가장 낮은 모델은 {best["모델"]}였습니다. 이 점수는 커밋 수 예측 성능을 보여 주며 AI가 개발량 증가의 원인이라는 증거나 코드 품질 향상의 증거는 아닙니다.'
 st.text_area('아래 문장을 복사해서 사용하세요',text,height=200)
 a,b,c=st.columns(3)
 a.download_button('점수 CSV 저장',scores.to_csv(index=False).encode('utf-8-sig'),'model_scores.csv','text/csv')
@@ -169,7 +196,7 @@ b.download_button('실제값·예측값 CSV 저장',pred.to_csv(index=False).enc
 c.download_button('보고서 문장 저장',text.encode('utf-8'),'report.txt','text/plain')
 with st.expander('모델과 해석에 대한 설명'):
     st.write('베이스라인은 학습 데이터 평균을 예측해요. 선형 회귀는 여러 입력의 선형 관계를 배워요. 포아송 회귀는 0 이상의 개수를 다루고, 랜덤 포레스트는 여러 나무의 예측을 평균해요.')
-    st.write('scikit-learn 모델을 사용해요. 포아송은 alpha=0.01, 최대 반복 3,000회. 랜덤 포레스트는 나무 150개, 깊이 12, 잎 최소 5행, random_state=42예요. 선형 회귀의 음수 예측도 그대로 평가해요. 평균·표준편차는 학습 데이터로만 계산해요.')
+    st.write('scikit-learn 모델을 사용하며 설정값은 위의 검증 비교로 선택합니다. 포아송 최대 반복 3,000회와 랜덤 포레스트 random_state=42는 고정합니다. 선형 회귀의 음수 예측도 그대로 평가해요. 평균·표준편차는 학습 데이터로만 계산해요.')
     st.write('R²는 평균값만 예측하는 것과 비교한 지표예요. 1에 가까울수록 좋고 음수도 가능해요. 실제값이 모두 같으면 표시하지 않아요. 모델 설정과 구현이 달라 이전 웹 버전과 점수가 다를 수 있어요.')
     st.write('AI 표시가 없는 커밋도 AI를 사용했을 수 있어요. AI 관련 오픈소스 프로젝트만으로 모든 개발자에게 일반화할 수 없어요. 이 실험만으로 코드 품질이나 AI 자체의 효과를 판단하지 않아요.')
 st.caption('데이터 출처: Abiram Bharathi S.A · Who Writes AI Code? 1.3M Open-Source AI Commits · CC BY 4.0')

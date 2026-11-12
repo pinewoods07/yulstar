@@ -127,23 +127,99 @@ def examples(monthly):
     periods=pd.PeriodIndex(df.month,freq='M');df[FEATURES[3]]=periods.year*12+periods.month
     return df
 
-def evaluate(monthly,start,end,ratio=.8):
-    df=examples(monthly);df=df[df.month.between(start,end)].copy()
+# Candidate ranges are explicit and finite: lowest validation error within this set.
+from sklearn.base import clone
+from sklearn.model_selection import ParameterGrid, TimeSeriesSplit
+
+SEARCH_SPACES = {
+    '선형 회귀': [{'linearregression__fit_intercept':[True,False]}],
+    '포아송 회귀': [{'poissonregressor__alpha':[0.0,0.001,0.01,0.1,1.0]}],
+    '랜덤 포레스트': [
+        {'n_estimators':[100,200], 'max_depth':[6,12,None],
+         'min_samples_leaf':[2,5], 'max_features':[0.8,1.0]},
+        {'n_estimators':[150], 'max_depth':[12],
+         'min_samples_leaf':[5], 'max_features':[0.8]},
+    ],
+}
+
+def chronological_folds(train):
+    months=np.array(sorted(train.month.unique()))
+    if len(months)<8:
+        raise ValueError('자동 비교에는 학습 기간이 최소 8개월 필요합니다. 분석 기간을 늘려 주세요.')
+    folds=[];description=[]
+    for a,b in TimeSeriesSplit(n_splits=3).split(months):
+        ti=np.flatnonzero(train.month.isin(months[a]).to_numpy())
+        vi=np.flatnonzero(train.month.isin(months[b]).to_numpy())
+        if len(ti)<5 or len(vi)<2:raise ValueError('검증 구간의 데이터가 부족합니다. 분석 기간을 늘려 주세요.')
+        folds.append((ti,vi))
+        description.append({'회차':len(folds),'학습 시작':months[a[0]],'학습 끝':months[a[-1]],
+                            '검증 시작':months[b[0]],'검증 끝':months[b[-1]],'학습 행':len(ti),'검증 행':len(vi)})
+    return folds,description
+
+def fit_checked(model,X,y):
+    with warnings.catch_warnings():
+        warnings.simplefilter('error',ConvergenceWarning)
+        model.fit(X,y)
+    return model
+
+def evaluate(monthly,start,end,ratio=.8,objective='MSE',progress=None):
+    if objective not in ('MAE','MSE'):raise ValueError('선택 기준은 MSE 또는 MAE여야 합니다.')
+    df=examples(monthly);df=df[df.month.between(start,end)].sort_values(['month','repo']).reset_index(drop=True)
     months=sorted(df.month.unique())
-    if len(months)<6:raise ValueError('전월과 연결된 기록이 있는 달이 최소 6개 필요합니다. 기간이나 데이터 파일을 늘려 주세요.')
-    cut=months[min(len(months)-1,max(1,int(len(months)*ratio)))];train=df[df.month<cut];test=df[df.month>=cut]
+    if len(months)<10:raise ValueError('자동 설정 비교에는 연결된 기록이 있는 달이 최소 10개 필요합니다. 기간을 늘려 주세요.')
+    cut=months[min(len(months)-1,max(1,int(len(months)*ratio)))];train=df[df.month<cut].reset_index(drop=True);test=df[df.month>=cut].reset_index(drop=True)
     if len(train)<20 or len(test)<5:raise ValueError('학습용 20행, 평가용 5행 이상이 필요합니다.')
-    models={'베이스라인':DummyRegressor(strategy='mean'),'선형 회귀':make_pipeline(StandardScaler(),LinearRegression()),'포아송 회귀':make_pipeline(StandardScaler(),PoissonRegressor(alpha=.01,max_iter=3000)),'랜덤 포레스트':RandomForestRegressor(n_estimators=150,max_depth=12,min_samples_leaf=5,max_features=.8,random_state=42,n_jobs=-1)}
-    scores=[];predictions=test[['repo','month','commits']].rename(columns={'commits':'실제 커밋 수'}).copy();errors=[]
-    for name,model in models.items():
+    folds,fold_info=chronological_folds(train)
+    models={'선형 회귀':make_pipeline(StandardScaler(),LinearRegression()),
+            '포아송 회귀':make_pipeline(StandardScaler(),PoissonRegressor(max_iter=3000)),
+            '랜덤 포레스트':RandomForestRegressor(random_state=42,n_jobs=2)}
+    X=train[FEATURES];y=train.commits
+    trials=[];chosen=[];errors=[];fitted={}
+    total=sum(len(list(ParameterGrid(SEARCH_SPACES[n]))) for n in models);done=0
+    for name,template in models.items():
+        candidates=[]
+        for candidate_id,params in enumerate(ParameterGrid(SEARCH_SPACES[name]),1):
+            record={'모델':name,'후보':candidate_id,'설정':json.dumps(params,ensure_ascii=False,sort_keys=True),
+                    '선택됨':False,'상태':'성공'}
+            maes=[];mses=[]
+            try:
+                for fold_id,(ti,vi) in enumerate(folds,1):
+                    model=fit_checked(clone(template).set_params(**params),X.iloc[ti],y.iloc[ti])
+                    p=model.predict(X.iloc[vi])
+                    if not np.isfinite(p).all():raise ValueError('유효하지 않은 예측값')
+                    mae=float(mean_absolute_error(y.iloc[vi],p));mse=float(mean_squared_error(y.iloc[vi],p))
+                    maes.append(mae);mses.append(mse)
+                    record[f'검증{fold_id} MAE']=mae;record[f'검증{fold_id} MSE']=mse
+                record['검증 평균 MAE']=float(np.mean(maes));record['검증 평균 MSE']=float(np.mean(mses))
+                candidates.append((record['검증 평균 '+objective],candidate_id,params,record))
+            except Exception as exc:
+                record['상태']='제외: '+type(exc).__name__
+                record['검증 평균 MAE']=np.nan;record['검증 평균 MSE']=np.nan
+            trials.append(record);done+=1
+            if progress:progress(done,total,f'{name} · {candidate_id}번 설정 비교 완료')
+        if not candidates:
+            errors.append(f'{name}: 모든 후보가 학습에 실패하여 제외했습니다.');continue
+        # Select only from development folds; final test values never participate.
+        _,candidate_id,params,record=min(candidates,key=lambda t:(t[0],t[1]))
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter('error',ConvergenceWarning)
-                model.fit(train[FEATURES],train.commits)
-            pred=model.predict(test[FEATURES])
-            if not np.isfinite(pred).all():raise ValueError('유효하지 않은 예측값')
-            scores.append({'모델':name,'MAE':mean_absolute_error(test.commits,pred),'MSE':mean_squared_error(test.commits,pred),'R²':r2_score(test.commits,pred) if test.commits.nunique()>1 else np.nan})
-            predictions[name]=pred
-        except Exception as e:errors.append(f'{name}: 학습에 실패해 비교에서 제외했습니다. ({type(e).__name__})')
-    if not scores:raise ValueError('모든 모델의 학습에 실패했습니다.')
-    return pd.DataFrame(scores),predictions,{'train':len(train),'test':len(test),'cut':cut,'first':months[0],'last':months[-1],'mean':train.commits.mean(),'eligible':len(df)},errors
+            fitted[name]=fit_checked(clone(template).set_params(**params),X,y)
+            record['선택됨']=True
+            chosen.append({'모델':name,'선택 기준':objective,'선택 설정':record['설정'],
+                           '검증 평균 MAE':record['검증 평균 MAE'],'검증 평균 MSE':record['검증 평균 MSE'],
+                           '성공 후보 수':len(candidates),'전체 후보 수':len(list(ParameterGrid(SEARCH_SPACES[name])))})
+        except Exception as exc:
+            errors.append(f'{name}: 선택한 설정의 전체 학습에 실패하여 제외했습니다. ({type(exc).__name__})')
+    fitted={'베이스라인':DummyRegressor(strategy='mean').fit(X,y),**fitted}
+    scores=[];predictions=test[['repo','month','commits']].rename(columns={'commits':'실제 커밋 수'}).copy()
+    for name,model in fitted.items():
+        try:
+            p=model.predict(test[FEATURES])
+            if not np.isfinite(p).all():raise ValueError('유효하지 않은 예측값')
+            scores.append({'모델':name,'MAE':mean_absolute_error(test.commits,p),'MSE':mean_squared_error(test.commits,p),
+                           'R²':r2_score(test.commits,p) if test.commits.nunique()>1 else np.nan})
+            predictions[name]=p
+        except Exception as exc:errors.append(f'{name}: 최종 예측에 실패했습니다. ({type(exc).__name__})')
+    info={'train':len(train),'test':len(test),'cut':cut,'first':months[0],'last':months[-1],
+          'mean':float(train.commits.mean()),'eligible':len(df),'objective':objective,
+          'trials':trials,'chosen':chosen,'folds':fold_info,'total_candidates':total}
+    return pd.DataFrame(scores),predictions,info,errors
