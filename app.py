@@ -52,22 +52,25 @@ st.header('01  데이터 준비')
 mode=st.radio('데이터가 어디 있나요?',['앱과 같은 깃허브 저장소','다른 공개 깃허브 저장소','직접 파일 올리기'],horizontal=True)
 ready=None;selection_key=None
 if mode=='앱과 같은 깃허브 저장소':
-    root=Path(__file__).resolve().parent
+    root=Path(__file__).resolve().parent / 'data'
     files=local_files(root);choices={str(p.relative_to(root)):p for p in files}
-    if not files:st.info('앱과 같은 폴더 또는 그 아래 폴더에 CSV·ZIP을 넣어 주세요. 데이터가 다른 저장소에 있으면 위에서 두 번째 방법을 고르세요.')
+    if not files:st.info('저장소 최상위의 data 폴더에서 CSV·ZIP을 찾지 못했습니다. app.py는 저장소 최상위에, 데이터는 data 폴더 안에 두세요.')
     else:
         preferred=[n for n in choices if 'commit' in n.lower() or n.lower().endswith('.zip')]
         selected=st.multiselect('읽을 파일 (연도별 파일을 모두 선택하세요)',list(choices),default=preferred or list(choices))
         signatures=tuple((str(choices[n]),choices[n].stat().st_size,choices[n].stat().st_mtime_ns) for n in selected)
-        selection_key=('local',signatures)
-        st.caption('저장소에 이미 내려받아진 파일을 직접 읽으므로 GitHub API 사용 한도와 관계없어요. ZIP 안의 CSV도 전부 읽어요.')
-        if st.button('선택한 데이터 읽기',type='primary',disabled=not selected):
+        selection_key=('data-folder-v1',signatures)
+        st.caption('data 폴더의 CSV·ZIP을 자동으로 읽습니다. 압축을 풀거나 파일을 다시 올릴 필요는 없습니다. 데이터 선택을 바꾸면 다시 읽습니다.')
+        read_clicked=st.button('선택한 데이터 다시 읽기',type='primary',disabled=not selected)
+        prior=st.session_state.get('loaded')
+        auto_load=bool(selected) and (prior is None or prior[0]!=selection_key)
+        if read_clicked or auto_load:
             try:
                 with st.spinner('전체 행을 읽고 월별로 정리하는 중입니다. 큰 파일은 몇 분 걸릴 수 있어요.'):
                     ready=load_local(signatures)
             except Exception as e:st.error(str(e))
 elif mode=='다른 공개 깃허브 저장소':
-    url=st.text_input('공개 저장소 주소',placeholder='https://github.com/사용자/저장소')
+    url=st.text_input('공개 저장소 주소',value='https://github.com/pinewoods07/yulstar')
     branch=st.text_input('브랜치 (비워 두면 기본 브랜치)',placeholder='main')
     if st.button('깃허브 파일 목록 확인',disabled=not url):
         try:
@@ -122,14 +125,14 @@ ratio=c.selectbox('학습에 쓸 기간',[.8,.7,.9],format_func=lambda v:f'앞 {
 st.caption('마지막 달은 수집이 덜 끝났을 수 있어 기본적으로 제외해요. 그 달이 완전한 데이터라면 직접 포함할 수 있어요.')
 st.write('**입력:** 지난달 AI 표시 비율·개발자 수·커밋 수·시간 흐름 → **예측:** 이번 달 커밋 수')
 st.caption('같은 달의 저장소들은 모두 같은 학습/평가 구간에 들어가요. 바로 전월 기록이 없거나 AI 비율을 계산할 수 없는 행은 제외해요. 평가할 때도 매달 실제 지난달 기록을 사용해요.')
-objective=st.radio('설정을 고르는 기준',['MSE','MAE'],horizontal=True)
+objective=st.radio('설정을 고르는 기준',['MAE','MSE'],horizontal=True,key='selection_metric_mae_v6')
 st.caption('MSE는 큰 예측 실수를 더 크게 벌점 처리하고, MAE는 평균적으로 몇 개 틀렸는지를 봅니다. 선택한 기준 하나로 설정을 고르고 두 점수 모두 표시합니다.')
 with st.expander('어떤 값을 비교하나요?'):
-    st.write('선형 회귀: 절편 사용 여부 2가지. 포아송 회귀: alpha 0, 0.001, 0.01, 0.1, 1의 5가지.')
+    st.write('선형 회귀: 절편 사용 여부 2가지. 포아송 회귀: alpha 0, 0.001, 0.01, 0.1, 1, 3, 10, 30, 100부터 비교합니다.')
     st.write('랜덤 포레스트: 나무 100·200개 × 깊이 6·12·제한 없음 × 잎 최소 2·5행 × 입력 비율 0.8·1.0의 24가지 조합과, 이전 설정(150개·깊이12·최소5행·비율0.8)을 합쳐 25가지를 비교합니다.')
-    st.write('총 32개 설정을 시간순 검증 3회씩 비교합니다. 학습용 구간 안에서 검증 평균 오차가 최소인 설정을 고른 뒤, 그 설정으로 학습용 전체를 다시 학습합니다. 마지막 평가용 구간은 설정 선택에 쓰지 않습니다.')
+    st.write('포아송은 가장 큰 값이 최선이면 상한을 3배·10배로 확장합니다(최대 1,000,000). 이후 최선 값 주변을 한 번 더 세밀하게 비교합니다. 각 설정을 시간순 검증 3회씩 비교합니다. 학습용 구간 안에서 검증 평균 오차가 최소인 설정을 고른 뒤, 그 설정으로 학습용 전체를 다시 학습합니다. 마지막 평가용 구간은 설정 선택에 쓰지 않습니다.')
     st.caption('random_state=42는 재현성을 위해, max_iter=3000은 계산을 충분히 반복하기 위해 고정합니다. 이 둘은 성능을 보고 고르지 않습니다. 계산은 데이터 크기에 따라 몇 분 걸릴 수 있습니다.')
-settings=('tuning-v3',selection_key,start,end,ratio,objective)
+settings=('mae-default-v6',selection_key,start,end,ratio,objective)
 if st.button('모델 학습하고 점수 비교하기',type='primary'):
     if start>end:st.error('시작 월이 마지막 월보다 늦어요.')
     else:
@@ -153,14 +156,20 @@ except ValueError as exc:
     st.error(str(exc))
     st.stop()
 for e in errors:st.warning(e)
+for note in info.get('search_notes',[]):st.warning(note)
 st.header('03  자동으로 선택한 설정')
 chosen=pd.DataFrame(info['chosen'])
 trials=pd.DataFrame(info['trials'])
 st.write(f"학습 구간 안에서 시간순으로 3번 검증하여, 평균 {info['objective']}가 가장 작은 설정을 적용했습니다.")
+st.caption(f'이번 실행에서 비교한 후보는 {info["total_candidates"]}개입니다.')
 st.caption('아래 값은 비교한 후보 중의 최저값입니다. 모든 가능한 설정 중 최적이라고 단정하지 않으며, 최종 평가 오차가 반드시 감소하는 것도 아닙니다.')
 st.dataframe(chosen,hide_index=True,use_container_width=True)
 with st.expander('비교한 모든 설정과 검증 점수 보기'):
     st.dataframe(trials,hide_index=True,use_container_width=True)
+    alpha_trials=trials[(trials['모델']=='포아송 회귀') & (trials['상태']=='성공')].sort_values('alpha')
+    if not alpha_trials.empty:
+        st.caption('포아송 alpha별 검증 평균 오차 · 최종 평가 점수가 아닌 설정 선택용 점수입니다.')
+        st.dataframe(alpha_trials[['alpha','탐색 단계','검증 평균 MSE','검증 평균 MAE','선택됨']],hide_index=True,use_container_width=True)
     st.dataframe(pd.DataFrame(info['folds']),hide_index=True,use_container_width=True)
 st.download_button('설정 비교 근거 CSV 저장',trials.to_csv(index=False).encode('utf-8-sig'),'hyperparameter_search.csv','text/csv')
 st.download_button('선택 설정과 검증 기간 저장',json.dumps({k:v for k,v in info.items() if k!='trials'},ensure_ascii=False,indent=2,default=str).encode('utf-8'),'experiment_settings.json','application/json')
@@ -184,7 +193,7 @@ with b:
     trend=pred.groupby('month')[['실제 커밋 수',best['모델']]].mean();st.line_chart(trend,color=['#243b40','#087e72'])
     last=trend.iloc[-1];st.write(f'**{trend.index[-1]}** 실제 평균은 **{last.iloc[0]:.2f}개**, {best["모델"]}의 예측 평균은 **{last.iloc[1]:.2f}개**였어요.')
 st.subheader('보고서에 붙일 문장')
-text=f'설정값을 임의로 확정하지 않고, 학습 구간에서 32개 후보 설정을 시간순으로 3번씩 검증하여 평균 {info["objective"]}가 가장 작은 설정을 모델별로 선택했습니다. 최종 평가 데이터는 설정 선택에 사용하지 않았습니다. '
+text=f'설정값을 임의로 확정하지 않고, 학습 구간에서 {info["total_candidates"]}개 후보 설정을 시간순으로 3번씩 검증하여 평균 {info["objective"]}가 가장 작은 설정을 모델별로 선택했습니다. 최종 평가 데이터는 설정 선택에 사용하지 않았습니다. '
 text+=' '.join(f"{r['모델']} 선택값은 {r['선택 설정']}이며 검증 평균 {info['objective']}는 {r['검증 평균 '+info['objective']]:.2f}였습니다." for r in info['chosen'])
 text+=f' 우리 팀은 깃허브 커밋 데이터를 이용해 월별 커밋 수를 예측하는 회귀 실험을 했습니다. 학습 데이터의 평균인 {info["mean"]:.2f}개를 항상 예측하는 베이스라인의 MAE는 {base.MAE:.2f}, MSE는 {base.MSE:.2f}였습니다. '
 text+=' '.join(f'{r["모델"]}의 MAE는 {r.MAE:.2f}, MSE는 {r.MSE:.2f}였습니다.' for _,r in scores.iterrows() if r['모델']!='베이스라인')

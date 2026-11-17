@@ -2,6 +2,7 @@
 from pathlib import Path
 from io import BytesIO
 import csv
+import re
 import io
 import json
 import zipfile
@@ -83,6 +84,8 @@ def aggregate(items, progress=None):
                         try:float(v)
                         except ValueError:c['numeric']=False
                 repo=row[mapping['repo']].strip();raw=row[mapping['date']].strip()
+                # Spreadsheet exports can remove the leading zero from hours.
+                raw=re.sub(r'^(\d{4}-\d{2}-\d{2})[ T](\d):',r'\1 0\2:',raw)
                 # ISO UTC source timestamps; reject missing/invalid dates explicitly.
                 try:
                     from datetime import datetime, timezone
@@ -133,7 +136,7 @@ from sklearn.model_selection import ParameterGrid, TimeSeriesSplit
 
 SEARCH_SPACES = {
     '선형 회귀': [{'linearregression__fit_intercept':[True,False]}],
-    '포아송 회귀': [{'poissonregressor__alpha':[0.0,0.001,0.01,0.1,1.0]}],
+    '포아송 회귀': [{'poissonregressor__alpha':[0.0,0.001,0.01,0.1,1.0,3.0,10.0,30.0,100.0]}],
     '랜덤 포레스트': [
         {'n_estimators':[100,200], 'max_depth':[6,12,None],
          'min_samples_leaf':[2,5], 'max_features':[0.8,1.0]},
@@ -141,6 +144,28 @@ SEARCH_SPACES = {
          'min_samples_leaf':[5], 'max_features':[0.8]},
     ],
 }
+
+ALPHA_LIMIT = 1_000_000.0
+
+def next_alpha_batch(tested, best, refined=False):
+    """Expand an upper-bound winner, then refine its adjacent interval once."""
+    values=sorted(set(float(v) for v in tested))
+    upper=values[-1]
+    if best==upper and upper<ALPHA_LIMIT:
+        batch=sorted(set(min(ALPHA_LIMIT,upper*k) for k in (3.0,10.0))-set(values))
+        return batch,'범위 확장'
+    if refined:
+        return [],'탐색 종료'
+    index=values.index(float(best))
+    lower=values[max(0,index-1)]
+    higher=values[min(len(values)-1,index+1)]
+    if lower==0:
+        lower=(best if best>0 else higher)/10
+    if higher<=lower:
+        return [],'탐색 종료'
+    batch=[float(f'{v:.10g}') for v in np.geomspace(lower,higher,9)]
+    batch=[v for v in sorted(set(batch)) if not any(np.isclose(v,x,rtol=1e-9,atol=0) for x in values)]
+    return batch,'주변 세부 비교'
 
 def chronological_folds(train):
     months=np.array(sorted(train.month.unique()))
@@ -162,7 +187,7 @@ def fit_checked(model,X,y):
         model.fit(X,y)
     return model
 
-def evaluate(monthly,start,end,ratio=.8,objective='MSE',progress=None):
+def evaluate(monthly,start,end,ratio=.8,objective='MAE',progress=None):
     if objective not in ('MAE','MSE'):raise ValueError('선택 기준은 MSE 또는 MAE여야 합니다.')
     df=examples(monthly);df=df[df.month.between(start,end)].sort_values(['month','repo']).reset_index(drop=True)
     months=sorted(df.month.unique())
@@ -175,12 +200,16 @@ def evaluate(monthly,start,end,ratio=.8,objective='MSE',progress=None):
             '랜덤 포레스트':RandomForestRegressor(random_state=42,n_jobs=2)}
     X=train[FEATURES];y=train.commits
     trials=[];chosen=[];errors=[];fitted={}
-    total=sum(len(list(ParameterGrid(SEARCH_SPACES[n]))) for n in models);done=0
+    total=sum(len(list(ParameterGrid(SEARCH_SPACES[n]))) for n in models);done=0;search_notes=[]
     for name,template in models.items():
         candidates=[]
-        for candidate_id,params in enumerate(ParameterGrid(SEARCH_SPACES[name]),1):
+        queue=[(p,'초기 비교') for p in ParameterGrid(SEARCH_SPACES[name])]
+        index=0;refined=False
+        while index<len(queue):
+            params,stage=queue[index];index+=1;candidate_id=index
             record={'모델':name,'후보':candidate_id,'설정':json.dumps(params,ensure_ascii=False,sort_keys=True),
-                    '선택됨':False,'상태':'성공'}
+                    '선택됨':False,'상태':'성공','탐색 단계':stage,
+                    'alpha':params.get('poissonregressor__alpha',np.nan)}
             maes=[];mses=[]
             try:
                 for fold_id,(ti,vi) in enumerate(folds,1):
@@ -196,7 +225,17 @@ def evaluate(monthly,start,end,ratio=.8,objective='MSE',progress=None):
                 record['상태']='제외: '+type(exc).__name__
                 record['검증 평균 MAE']=np.nan;record['검증 평균 MSE']=np.nan
             trials.append(record);done+=1
-            if progress:progress(done,total,f'{name} · {candidate_id}번 설정 비교 완료')
+            if name=='포아송 회귀' and index==len(queue) and candidates:
+                best_so_far=min(candidates,key=lambda t:(t[0],t[1]))[2]['poissonregressor__alpha']
+                tested=[p['poissonregressor__alpha'] for p,_ in queue]
+                extra,next_stage=next_alpha_batch(tested,best_so_far,refined)
+                if next_stage=='주변 세부 비교':refined=True
+                if extra:
+                    queue.extend(({'poissonregressor__alpha':a},next_stage) for a in extra)
+                    total+=len(extra)
+                elif best_so_far==max(tested):
+                    search_notes.append(f'포아송 alpha={best_so_far:g}가 탐색 상한에서 선택됐습니다. 계산량 제한 상한은 {ALPHA_LIMIT:g}이며, 전체 범위의 최적값으로 단정할 수 없습니다.')
+            if progress:progress(done,total,f'{name} · {stage} · {candidate_id}번 설정 비교 완료')
         if not candidates:
             errors.append(f'{name}: 모든 후보가 학습에 실패하여 제외했습니다.');continue
         # Select only from development folds; final test values never participate.
@@ -206,7 +245,7 @@ def evaluate(monthly,start,end,ratio=.8,objective='MSE',progress=None):
             record['선택됨']=True
             chosen.append({'모델':name,'선택 기준':objective,'선택 설정':record['설정'],
                            '검증 평균 MAE':record['검증 평균 MAE'],'검증 평균 MSE':record['검증 평균 MSE'],
-                           '성공 후보 수':len(candidates),'전체 후보 수':len(list(ParameterGrid(SEARCH_SPACES[name])))})
+                           '성공 후보 수':len(candidates),'전체 후보 수':len(queue)})
         except Exception as exc:
             errors.append(f'{name}: 선택한 설정의 전체 학습에 실패하여 제외했습니다. ({type(exc).__name__})')
     fitted={'베이스라인':DummyRegressor(strategy='mean').fit(X,y),**fitted}
@@ -221,5 +260,5 @@ def evaluate(monthly,start,end,ratio=.8,objective='MSE',progress=None):
         except Exception as exc:errors.append(f'{name}: 최종 예측에 실패했습니다. ({type(exc).__name__})')
     info={'train':len(train),'test':len(test),'cut':cut,'first':months[0],'last':months[-1],
           'mean':float(train.commits.mean()),'eligible':len(df),'objective':objective,
-          'trials':trials,'chosen':chosen,'folds':fold_info,'total_candidates':total}
+          'trials':trials,'chosen':chosen,'folds':fold_info,'total_candidates':len(trials),'search_notes':search_notes,'alpha_limit':ALPHA_LIMIT}
     return pd.DataFrame(scores),predictions,info,errors
