@@ -1,4 +1,4 @@
-"""GitHub commit ingestion and chronological regression evaluation."""
+
 from pathlib import Path
 from io import BytesIO
 import csv
