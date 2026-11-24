@@ -1,4 +1,4 @@
-
+"""GitHub commit ingestion and chronological regression evaluation."""
 from pathlib import Path
 from io import BytesIO
 import csv
@@ -138,8 +138,8 @@ SEARCH_SPACES = {
     '선형 회귀': [{'linearregression__fit_intercept':[True,False]}],
     '포아송 회귀': [{'poissonregressor__alpha':[0.0,0.001,0.01,0.1,1.0,3.0,10.0,30.0,100.0]}],
     '랜덤 포레스트': [
-        {'n_estimators':[100,200], 'max_depth':[6,12,None],
-         'min_samples_leaf':[2,5], 'max_features':[0.8,1.0]},
+        {'n_estimators':[100,200], 'max_depth':[3,6,12,None],
+         'min_samples_leaf':[1,2,5,10,20], 'max_features':[0.5,0.8,1.0]},
         {'n_estimators':[150], 'max_depth':[12],
          'min_samples_leaf':[5], 'max_features':[0.8]},
     ],
@@ -204,7 +204,7 @@ def evaluate(monthly,start,end,ratio=.8,objective='MAE',progress=None):
     for name,template in models.items():
         candidates=[]
         queue=[(p,'초기 비교') for p in ParameterGrid(SEARCH_SPACES[name])]
-        index=0;refined=False
+        index=0;refined=0;forest_refined=False
         while index<len(queue):
             params,stage=queue[index];index+=1;candidate_id=index
             record={'모델':name,'후보':candidate_id,'설정':json.dumps(params,ensure_ascii=False,sort_keys=True),
@@ -228,13 +228,24 @@ def evaluate(monthly,start,end,ratio=.8,objective='MAE',progress=None):
             if name=='포아송 회귀' and index==len(queue) and candidates:
                 best_so_far=min(candidates,key=lambda t:(t[0],t[1]))[2]['poissonregressor__alpha']
                 tested=[p['poissonregressor__alpha'] for p,_ in queue]
-                extra,next_stage=next_alpha_batch(tested,best_so_far,refined)
-                if next_stage=='주변 세부 비교':refined=True
+                extra,next_stage=next_alpha_batch(tested,best_so_far,refined>=3)
+                if next_stage=='주변 세부 비교':refined+=1
                 if extra:
                     queue.extend(({'poissonregressor__alpha':a},next_stage) for a in extra)
                     total+=len(extra)
                 elif best_so_far==max(tested):
                     search_notes.append(f'포아송 alpha={best_so_far:g}가 탐색 상한에서 선택됐습니다. 계산량 제한 상한은 {ALPHA_LIMIT:g}이며, 전체 범위의 최적값으로 단정할 수 없습니다.')
+            if name=='랜덤 포레스트' and index==len(queue) and candidates and not forest_refined:
+                forest_refined=True
+                best_params=min(candidates,key=lambda t:(t[0],t[1]))[2]
+                leaf=best_params['min_samples_leaf']
+                local_grid={'n_estimators':[100,200,300,500],
+                            'max_depth':[best_params['max_depth']],
+                            'max_features':[best_params['max_features']],
+                            'min_samples_leaf':sorted(set([max(1,leaf-2),max(1,leaf-1),leaf,leaf+1,leaf+2]))}
+                seen={json.dumps(p,sort_keys=True) for p,_ in queue}
+                extra=[p for p in ParameterGrid(local_grid) if json.dumps(p,sort_keys=True) not in seen]
+                queue.extend((p,'주변 세부 비교') for p in extra);total+=len(extra)
             if progress:progress(done,total,f'{name} · {stage} · {candidate_id}번 설정 비교 완료')
         if not candidates:
             errors.append(f'{name}: 모든 후보가 학습에 실패하여 제외했습니다.');continue
